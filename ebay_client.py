@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
-import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -12,29 +12,30 @@ import httpx
 
 from models import CompRecord
 
-BASE_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
+BROWSE_API_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+IDENTITY_API_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = 2
-XML_NS = {"ns": "http://www.ebay.com/marketplace/search/v1/services"}
+SOURCE_NOTE = "eBay active listings — not sold data, verify manually"
 
 logger = logging.getLogger(__name__)
+
+_TOKEN_CACHE: dict[str, Any] = {"token": None, "expires_at": None}
 
 
 def fetch_comps(query: str, max_results: int = 10) -> list[CompRecord]:
     app_id = os.getenv("EBAY_APP_ID")
+    cert_id = os.getenv("EBAY_CERT_ID") or os.getenv("EBAY_CLIENT_SECRET")
     if not app_id:
         raise RuntimeError("EBAY_APP_ID environment variable is required")
+    if not cert_id:
+        raise RuntimeError("EBAY_CERT_ID environment variable is required for Browse API auth")
 
+    token = _get_app_token(app_id, cert_id)
     params = {
-        "OPERATION-NAME": "findCompletedItems",
-        "SERVICE-VERSION": "1.13.0",
-        "SECURITY-APPNAME": app_id,
-        "RESPONSE-DATA-FORMAT": "XML",
-        "REST-PAYLOAD": "true",
-        "keywords": query,
-        "paginationInput.entriesPerPage": str(max_results),
-        "itemFilter(0).name": "SoldItemsOnly",
-        "itemFilter(0).value": "true",
+        "q": query,
+        "filter": "conditionIds:{3000|4000}",
+        "limit": str(min(max_results, 20)),
     }
 
     last_error: Exception | None = None
@@ -42,17 +43,26 @@ def fetch_comps(query: str, max_results: int = 10) -> list[CompRecord]:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             with httpx.Client(timeout=20.0) as client:
-                response = client.get(BASE_URL, params=params)
+                response = client.get(
+                    BROWSE_API_URL,
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+                    },
+                )
 
             if response.status_code == 200:
-                items = _extract_items_from_xml(response.text)
+                payload = response.json()
+                items = payload.get("itemSummaries") or []
                 comps = [_normalize_comp(item) for item in items][:max_results]
 
                 if not comps:
-                    logger.warning("No eBay sold comps returned for query: %s", query)
+                    logger.warning("No eBay active comps returned for query: %s", query)
                     return []
 
-                logger.info("Fetched %s eBay comps for query: %s", len(comps), query)
+                logger.info("Fetched %s eBay active comps for query: %s", len(comps), query)
                 return comps
 
             if response.status_code == 429 and attempt < MAX_ATTEMPTS:
@@ -60,7 +70,7 @@ def fetch_comps(query: str, max_results: int = 10) -> list[CompRecord]:
                 continue
 
             raise RuntimeError(
-                f"eBay Finding API returned {response.status_code}: {response.text[:300]}"
+                f"eBay Browse API returned {response.status_code}: {response.text[:300]}"
             )
 
         except Exception as exc:
@@ -73,58 +83,71 @@ def fetch_comps(query: str, max_results: int = 10) -> list[CompRecord]:
     raise RuntimeError(f"Failed to fetch eBay comps after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
-def _extract_items_from_xml(xml_text: str) -> list[dict[str, Any]]:
-    root = ET.fromstring(xml_text)
-    ack = root.find(".//ns:ack", XML_NS)
-    if ack is not None and ack.text not in {"Success", "Warning"}:
-        error_message = root.find(".//ns:errorMessage/ns:error/ns:message", XML_NS)
-        detail = error_message.text if error_message is not None else "unknown eBay API error"
-        raise RuntimeError(f"eBay Finding API error: {detail}")
+def _get_app_token(app_id: str, cert_id: str) -> str:
+    cached_token = _TOKEN_CACHE.get("token")
+    expires_at = _TOKEN_CACHE.get("expires_at")
+    if cached_token and isinstance(expires_at, datetime) and expires_at > datetime.now(timezone.utc):
+        return cached_token
 
-    items: list[dict[str, Any]] = []
-    for item in root.findall(".//ns:searchResult/ns:item", XML_NS):
-        items.append(
-            {
-                "itemId": _xml_text(item, "ns:itemId"),
-                "title": _xml_text(item, "ns:title"),
-                "listingInfo.endTime": _xml_text(item, "ns:listingInfo/ns:endTime"),
-                "sellingStatus.currentPrice": _xml_attr(
-                    item, "ns:sellingStatus/ns:currentPrice", "currencyId"
-                ),
-                "sellingStatus.currentPrice.value": _xml_text(item, "ns:sellingStatus/ns:currentPrice"),
-                "shippingInfo.shippingServiceCost": _xml_text(item, "ns:shippingInfo/ns:shippingServiceCost"),
-                "condition.conditionDisplayName": _xml_text(item, "ns:condition/ns:conditionDisplayName"),
-                "viewItemURL": _xml_text(item, "ns:viewItemURL"),
-            }
+    credentials = base64.b64encode(f"{app_id}:{cert_id}".encode("utf-8")).decode("ascii")
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(
+            IDENTITY_API_URL,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
         )
-    return items
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to fetch eBay app token: {response.status_code} {response.text[:300]}")
+
+    payload = response.json()
+    token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 7200))
+    if not token:
+        raise RuntimeError("eBay token response missing access_token")
+
+    _TOKEN_CACHE["token"] = token
+    _TOKEN_CACHE["expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=max(expires_in - 60, 60))
+    return token
 
 
-def _normalize_comp(raw: dict) -> CompRecord:
+def _normalize_comp(raw: dict[str, Any]) -> CompRecord:
+    item_id = _as_str(raw.get("itemId") or raw.get("legacyItemId") or "")
+    price = _to_decimal(((raw.get("price") or {}).get("value"))) or Decimal("0.00")
+    shipping_cost = _extract_shipping_cost(raw.get("shippingOptions"))
+    condition = _nullable_str(raw.get("condition") or raw.get("conditionId"))
+    item_web_url = _as_str(raw.get("itemWebUrl") or "")
+    if item_web_url:
+        separator = "&" if "?" in item_web_url else "?"
+        item_web_url = f"{item_web_url}{separator}source_note={SOURCE_NOTE}"
+
     return CompRecord(
-        item_id=_as_str(raw.get("itemId") or ""),
+        item_id=item_id,
         title=_as_str(raw.get("title") or ""),
-        sold_price=_to_decimal(raw.get("sellingStatus.currentPrice.value")) or Decimal("0.00"),
-        sold_date=_to_datetime(raw.get("listingInfo.endTime")),
-        shipping_cost=_to_decimal(raw.get("shippingInfo.shippingServiceCost")),
-        condition=_nullable_str(raw.get("condition.conditionDisplayName")),
-        url=_as_str(raw.get("viewItemURL") or ""),
+        sold_price=price,
+        sold_date=_to_datetime(raw.get("itemCreationDate") or raw.get("listingDate")),
+        shipping_cost=shipping_cost,
+        condition=condition,
+        url=item_web_url,
     )
 
 
-def _xml_text(element: ET.Element, path: str) -> str | None:
-    node = element.find(path, XML_NS)
-    if node is None or node.text is None:
+def _extract_shipping_cost(shipping_options: Any) -> Decimal | None:
+    if not isinstance(shipping_options, list):
         return None
-    return node.text.strip()
-
-
-def _xml_attr(element: ET.Element, path: str, attr_name: str) -> str | None:
-    node = element.find(path, XML_NS)
-    if node is None:
-        return None
-    value = node.attrib.get(attr_name)
-    return value.strip() if value else None
+    for option in shipping_options:
+        if not isinstance(option, dict):
+            continue
+        shipping_cost = _to_decimal(((option.get("shippingCost") or {}).get("value")))
+        if shipping_cost is not None:
+            return shipping_cost
+    return None
 
 
 def _to_decimal(value: Any) -> Decimal | None:
