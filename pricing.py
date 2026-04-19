@@ -6,7 +6,7 @@ from statistics import median
 from models import CompRecord
 
 LOT_FEE = Decimal("3.00")
-PROFIT_FLOOR = Decimal("50.00")
+PROFIT_FLOOR = Decimal("25.00")
 BUYER_PREMIUM_RATE = Decimal("0.15")
 EBAY_FEE_RATE = Decimal("0.13")
 CENT = Decimal("0.01")
